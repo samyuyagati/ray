@@ -911,8 +911,12 @@ TEST_P(PullManagerWithAdmissionControlTest, TestCancel) {
       pull_manager_.OnLocationChange(oids[i], {}, "", NodeID::Nil(), false,
                                      object_sizes[i]);
     }
+   
+    std::cerr << "TestCancel: expected " << num_active_requests_expected_before << " before cancel\n";
+
     AssertNumActiveRequestsEquals(num_active_requests_expected_before);
     pull_manager_.CancelPull(req_ids[cancel_idx]);
+    std::cerr << "TestCancel: expected " << num_active_requests_expected_after << " after cancel\n";   
     AssertNumActiveRequestsEquals(num_active_requests_expected_after);
 
     // Request is really canceled.
@@ -1177,6 +1181,74 @@ TEST_P(PullManagerTest, TestTimeOutAfterFailedPull) {
   RAY_UNUSED(pull_manager_.CancelPull(req_id));
 
   AssertNoLeaks();
+}
+
+TEST_P(PullManagerWithAdmissionControlTest, TestNoDeadlockAfterFailure) {
+  auto prio = BundlePriority::TASK_ARGS;
+  if (GetParam()) {
+    prio = BundlePriority::GET_REQUEST;
+  }
+  /// Test admission control for a single pull bundle request. We should
+  /// activate the request when we are under the reported capacity and
+  /// deactivate it when we are over.
+  auto refs = CreateObjectRefs(3);
+  auto oids = ObjectRefsToIds(refs);
+  size_t object_size = 2;
+  AssertNumActiveRequestsEquals(0);
+  std::vector<rpc::ObjectReference> objects_to_locate;
+  auto req_id = pull_manager_.Pull(refs, prio, &objects_to_locate);
+  ASSERT_EQ(ObjectRefsToIds(objects_to_locate), oids);
+  ASSERT_TRUE(pull_manager_.HasPullsQueued());
+
+  std::unordered_set<NodeID> client_ids;
+//  client_ids.insert(NodeID::FromRandom());
+  // Caller should provide size and location of the object in non-test scenarios
+  // Provide an empty client list so no objects have locs where available
+  for (size_t i = 0; i < oids.size(); i++) {
+    ASSERT_FALSE(pull_manager_.IsObjectActive(oids[i]));
+    pull_manager_.OnLocationChange(oids[i], client_ids, "", NodeID::Nil(), false,
+                                   object_size);
+  }
+
+  // Reduce the available memory to prevent immediately activating next request.
+  ASSERT_TRUE(num_abort_calls_.empty());
+  pull_manager_.UpdatePullsBasedOnAvailableMemory(oids.size() * object_size + 1);
+
+  // Create a second requests with available obj locs
+  auto refs_available = CreateObjectRefs(3);
+  auto oids_available = ObjectRefsToIds(refs);
+  AssertNumActiveRequestsEquals(0);
+  std::vector<rpc::ObjectReference> objects_to_locate_available;
+  auto req_id_available = pull_manager_.Pull(refs_available, prio, &objects_to_locate_available);
+  ASSERT_EQ(ObjectRefsToIds(objects_to_locate_available), oids_available);
+  ASSERT_TRUE(pull_manager_.HasPullsQueued());
+
+  std::unordered_set<NodeID> client_ids_available;
+  client_ids_available.insert(NodeID::FromRandom());
+  // Caller should provide size and location of the object in non-test scenarios
+  // Provide an empty client list so no objects have locs where available
+  for (size_t i = 0; i < oids_available.size(); i++) {
+    ASSERT_FALSE(pull_manager_.IsObjectActive(oids_available[i]));
+    pull_manager_.OnLocationChange(oids_available[i], client_ids_available, "", NodeID::Nil(), false,
+                                   object_size);
+  }
+
+  // Check that first bundle wasn't activated and second bundle was.
+  ASSERT_EQ(num_send_pull_request_calls_, oids_available.size()); // TODO make sizes different for oids and oids_available
+  ASSERT_EQ(num_restore_spilled_object_calls_, 0);
+  AssertNumActiveRequestsEquals(oids_available.size());
+  ASSERT_TRUE(IsUnderCapacity(oids_available.size() * object_size));
+  for (size_t i = 0; i < oids.size(); i++) {
+    ASSERT_TRUE(pull_manager_.IsObjectActive(oids_available[i]));
+  }
+  ASSERT_TRUE(pull_manager_.PullRequestActiveOrWaitingForMetadata(req_id_available));
+  ASSERT_FALSE(pull_manager_.HasPullsQueued());
+
+  for (size_t i = 0; i < oids.size(); i++) {
+    ASSERT_FALSE(pull_manager_.IsObjectActive(oids[i]));
+  }
+  ASSERT_FALSE(pull_manager_.PullRequestActiveOrWaitingForMetadata(req_id));
+
 }
 
 INSTANTIATE_TEST_SUITE_P(WorkerOrTaskRequests, PullManagerTest,

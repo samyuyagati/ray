@@ -57,6 +57,10 @@ uint64_t PullManager::Pull(const std::vector<rpc::ObjectReference> &object_ref_b
     }
   }
   Queue::iterator bundle_it;
+  // TODO: next_req_id_++ should be (sometimes?) replaced with something
+  // else -- goal is requests are processed not necessarily in incoming
+  // order (rather, process earliest request that also has locations). 
+  // Can this be done with modifications to enqueueing alone?
   if (prio == BundlePriority::GET_REQUEST) {
     bundle_it =
         get_request_bundles_.emplace(next_req_id_++, std::move(deduplicated)).first;
@@ -122,6 +126,45 @@ bool PullManager::ActivateNextPullBundleRequest(const Queue &bundles,
     // There is at least one object size missing. We should not activate the
     // bundle, since it may put us over the available capacity.
     return false;
+  }
+
+  // TODO: hacky, should probably also change priorities when enqueuing
+  // rather than just checking on dequeue.
+  // while next_request's args don't have locations, look for next earliest
+  // pull request
+  // ntries below assumes that req ids in queue are sequential w/ no gaps;
+  // valid? if no, how to remove that assumption in code below?
+  // We want all args to have locations. 
+  int ntries = 1;
+  bool hasLocs = false;
+  while (!hasLocs) {
+    std::cerr << "ActivateNextPullRequest: ntries = " << ntries << ", req ID = " << (*highest_req_id_being_pulled + ntries) << "\n";
+    hasLocs = true;
+    const auto next_last_request_it = bundles.find(*highest_req_id_being_pulled + ntries);
+    if (next_last_request_it == bundles.end()) {
+      // No pull request in the queue had locations: return first request.
+      next_request_it = bundles.find(*highest_req_id_being_pulled);
+      next_request_it++; // as in L117
+      break;
+    }   
+    next_request_it = next_last_request_it;
+    ntries++;
+    // TODO: also need to check if there are no requests in the queue left
+    // and figure out what to do in that case (all requests in queue have no
+    // locations)
+    auto objs = next_request_it->second.objects;
+    for (unsigned long int i = 0; i < objs.size(); i++) {
+      auto it = object_pull_requests_.find(ObjectRefToId(objs[i]));
+      if (it == object_pull_requests_.end()) {
+        hasLocs = false;
+        continue;
+      }
+      auto &node_vector = it->second.client_locations; 
+      if (node_vector.size() == 0) { 
+        hasLocs = false;
+      }
+    }
+    if (!hasLocs) { std::cerr << ">>>>>>>>>>>>>>>>>>>>>>> Missing objects\n"; }
   }
 
   // Activate the pull bundle request if possible.
